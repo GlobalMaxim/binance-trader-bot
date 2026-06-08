@@ -12,7 +12,7 @@ class RejectReason(StrEnum):
     NOTIONAL_TOO_LOW = "NOTIONAL_TOO_LOW"
     INSUFFICIENT_BALANCE = "INSUFFICIENT_BALANCE"
     MAX_POSITIONS = "MAX_POSITIONS"
-    NO_OPEN_POSITION = "NO_OPEN_POSITION"
+    NO_OPEN_POSITION = "NO_OPEN_POSITION"  # legacy — no longer generated (long-only system)
     HOLD_SIGNAL = "HOLD_SIGNAL"
     # Legacy values kept for DB query compatibility — no longer written by new code
     SL_HIT = "SL_HIT"
@@ -77,14 +77,3 @@ def evaluate(
         return RiskDecision.REJECTED, 0.0, RejectReason.MAX_POSITIONS
 
     return RiskDecision.APPROVED, qty, None
-
-
-def evaluate_sell(
-    has_open_position: bool,
-) -> tuple[RiskDecision, RejectReason | None]:
-    """Risk evaluation for a SELL signal.
-    Only meaningful rejection: no position to close.
-    """
-    if not has_open_position:
-        return RiskDecision.REJECTED, RejectReason.NO_OPEN_POSITION
-    return RiskDecision.APPROVED, None

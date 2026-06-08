@@ -32,6 +32,7 @@ EVT_TRAILING_STOP         = "trailing_stop"
 EVT_REGIME_FLIP           = "regime_flip"
 EVT_TIME_EXIT             = "time_exit"
 EVT_STRATEGY_EXIT         = "strategy_exit"
+EVT_MEAN_REVERSION        = "mean_reversion"
 
 
 async def write_log(

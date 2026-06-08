@@ -18,6 +18,7 @@ class ExitReason(StrEnum):
     TRAILING_STOP = "TRAILING_STOP"
     REGIME_FLIP = "REGIME_FLIP"
     TIME_EXIT = "TIME_EXIT"
+    MEAN_REVERSION = "MEAN_REVERSION"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,22 +51,9 @@ class StrategyConfig:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _cross_above(a: pd.Series, b: pd.Series) -> pd.Series:
-    return (a > b) & (a.shift(1) <= b.shift(1))
-
-
-def _cross_below(a: pd.Series, b: pd.Series) -> pd.Series:
-    return (a < b) & (a.shift(1) >= b.shift(1))
-
-
 def _trough(series: pd.Series) -> pd.Series:
     """True where series has local minimum (stopped falling, starting to rise)."""
     return (series > series.shift(1)) & (series.shift(1) <= series.shift(2))
-
-
-def _peak(series: pd.Series) -> pd.Series:
-    """True where series has local maximum (stopped rising, starting to fall)."""
-    return (series < series.shift(1)) & (series.shift(1) >= series.shift(2))
 
 
 def _near_ema(df: pd.DataFrame, ema_col: str, pct: float) -> pd.Series:
@@ -98,11 +86,13 @@ def is_ranging(df: pd.DataFrame, cfg: StrategyConfig) -> pd.Series:
 # Entry logic
 #
 # Design rationale:
-#   Range  → mean-reversion: buy oversold near BB lower, sell overbought near BB upper
-#   Trend  → trend-following: buy pullbacks in uptrend, sell rallies in downtrend
+#   Range  → mean-reversion: buy oversold near BB lower
+#   Trend  → trend-following: buy pullbacks in uptrend
 #
 # Each entry requires 3-of-4 conditions (RSI, location, MACD inflection, volume)
 # so no single weak signal triggers a trade.
+#
+# Long-only system. Exits handled exclusively by check_exit().
 # ---------------------------------------------------------------------------
 
 def _range_buy(df: pd.DataFrame, cfg: StrategyConfig) -> pd.Series:
@@ -116,31 +106,11 @@ def _range_buy(df: pd.DataFrame, cfg: StrategyConfig) -> pd.Series:
     return regime_ok & rsi_ok & confirm
 
 
-def _range_sell(df: pd.DataFrame, cfg: StrategyConfig) -> pd.Series:
-    regime_ok = is_ranging(df, cfg)
-    rsi_ok = df["rsi"] >= cfg.range_rsi_overbought
-    near_bb = _near_bb_band(df, "bb_upper", cfg.range_bb_near_pct)
-    macd_ok = _peak(df["macd_hist"])
-    vol_ok = _volume_above_ma(df, cfg.volume_ma_period, cfg.volume_min_mult)
-    confirm = (near_bb.astype(int) + macd_ok.astype(int) + vol_ok.astype(int)) >= 2
-    return regime_ok & rsi_ok & confirm
-
-
 def _trend_buy(df: pd.DataFrame, cfg: StrategyConfig) -> pd.Series:
     """Buy pullback in uptrend: price near EMA, MACD trough, volume OK."""
     regime_ok = df["regime"] == MarketRegime.TREND_UP
     near_ema = _near_ema(df, "ema_20", cfg.trend_ema_touch_pct)
     macd_ok = _trough(df["macd_hist"])
-    vol_ok = _volume_above_ma(df, cfg.volume_ma_period, cfg.volume_min_mult)
-    confirm = (near_ema.astype(int) + macd_ok.astype(int) + vol_ok.astype(int)) >= 2
-    return regime_ok & confirm
-
-
-def _trend_sell(df: pd.DataFrame, cfg: StrategyConfig) -> pd.Series:
-    """Sell rally in downtrend: price near EMA, MACD peak, volume OK."""
-    regime_ok = df["regime"] == MarketRegime.TREND_DOWN
-    near_ema = _near_ema(df, "ema_20", cfg.trend_ema_touch_pct)
-    macd_ok = _peak(df["macd_hist"])
     vol_ok = _volume_above_ma(df, cfg.volume_ma_period, cfg.volume_min_mult)
     confirm = (near_ema.astype(int) + macd_ok.astype(int) + vol_ok.astype(int)) >= 2
     return regime_ok & confirm
@@ -170,16 +140,9 @@ def generate_signals(
         cfg = StrategyConfig()
 
     buy = _trend_buy(df, cfg) | _range_buy(df, cfg)
-    sell = _trend_sell(df, cfg) | _range_sell(df, cfg)
-
-    # Self-exclusion: a bar can't be both BUY and SELL
-    conflict = buy & sell
-    buy = buy & ~conflict
-    sell = sell & ~conflict
 
     signal = pd.Series(Signal.HOLD, index=df.index)
     signal[buy] = Signal.BUY
-    signal[sell] = Signal.SELL
 
     signal = _apply_cooldown(signal, cfg.cooldown_bars)
     return signal
@@ -197,6 +160,7 @@ class ExitCheckInput:
     high: float
     low: float
     atr: float
+    rsi: float
     regime: str   # MarketRegime value
     bars_held: int
 
@@ -253,6 +217,9 @@ def _check_exit_long(
         trail_level = high_water - cfg.trail_atr_mult * atr
         if row.low <= trail_level:
             return ExitReason.TRAILING_STOP
+
+    if row.regime == MarketRegime.RANGE and row.rsi >= cfg.range_rsi_overbought:
+        return ExitReason.MEAN_REVERSION
 
     if row.regime == MarketRegime.TREND_DOWN:
         return ExitReason.REGIME_FLIP

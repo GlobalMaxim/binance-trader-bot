@@ -14,7 +14,7 @@ from src.engine.portfolio import PortfolioState
 from src.execution.executor import OrderResult, execute_market_buy, execute_market_sell
 from src.features.indicators import candles_to_dataframe, compute_all_indicators
 from src.risk import risk
-from src.risk.risk import RejectReason, RiskConfig, RiskDecision, evaluate_sell, position_size
+from src.risk.risk import RejectReason, RiskConfig, RiskDecision, position_size
 from src.storage.candle_repo import upsert_candles
 from src.storage.decision_repo import DecisionRecord, save_decision
 from src.storage.log_repo import (
@@ -32,7 +32,7 @@ from src.storage.log_repo import (
     EVT_SIGNAL_GENERATED,
     EVT_REGIME_FLIP,
     EVT_SL_HIT,
-    EVT_STRATEGY_EXIT,
+    EVT_MEAN_REVERSION,
     EVT_TICK_START,
     EVT_TIME_EXIT,
     EVT_TP_HIT,
@@ -59,11 +59,12 @@ log = logging.getLogger(__name__)
 _MIN_CANDLES = 60  # enough for all indicators (EMA-50 + MACD-26 + warmup)
 
 _EXIT_EVT: dict[ExitReason, str] = {
-    ExitReason.STOP_LOSS:     EVT_SL_HIT,
-    ExitReason.TAKE_PROFIT:   EVT_TP_HIT,
-    ExitReason.TRAILING_STOP: EVT_TRAILING_STOP,
-    ExitReason.REGIME_FLIP:   EVT_REGIME_FLIP,
-    ExitReason.TIME_EXIT:     EVT_TIME_EXIT,
+    ExitReason.STOP_LOSS:       EVT_SL_HIT,
+    ExitReason.TAKE_PROFIT:     EVT_TP_HIT,
+    ExitReason.TRAILING_STOP:   EVT_TRAILING_STOP,
+    ExitReason.REGIME_FLIP:     EVT_REGIME_FLIP,
+    ExitReason.TIME_EXIT:       EVT_TIME_EXIT,
+    ExitReason.MEAN_REVERSION:  EVT_MEAN_REVERSION,
 }
 
 
@@ -85,29 +86,19 @@ def _f(val: object) -> float | None:
 
 
 def _signal_reason(df: pd.DataFrame, signal: Signal) -> str | None:
-    if signal == Signal.HOLD:
+    if signal != Signal.BUY:
         return None
     row = df.iloc[-1]
     rsi = float(row["rsi"])
     parts: list[str] = []
-    if signal == Signal.BUY:
-        if rsi < 25.0:
-            parts.append("rsi_deep_oversold")
-        else:
-            parts.append("rsi_oversold")
-            if float(row["ema_20"]) > float(row["ema_50"]):
-                parts.append("ema_cross")
-            if len(df) >= 2 and float(df["macd_hist"].iloc[-1]) > float(df["macd_hist"].iloc[-2]):
-                parts.append("macd_turning")
-    else:  # SELL
-        if rsi > 75.0:
-            parts.append("rsi_deep_overbought")
-        else:
-            parts.append("rsi_overbought")
-            if float(row["ema_20"]) < float(row["ema_50"]):
-                parts.append("ema_cross")
-            if len(df) >= 2 and float(df["macd_hist"].iloc[-1]) < float(df["macd_hist"].iloc[-2]):
-                parts.append("macd_turning")
+    if rsi < 25.0:
+        parts.append("rsi_deep_oversold")
+    else:
+        parts.append("rsi_oversold")
+        if float(row["ema_20"]) > float(row["ema_50"]):
+            parts.append("ema_cross")
+        if len(df) >= 2 and float(df["macd_hist"].iloc[-1]) > float(df["macd_hist"].iloc[-2]):
+            parts.append("macd_turning")
     return "+".join(parts) if parts else None
 
 
@@ -431,6 +422,7 @@ class TradingEngine:
                 high=float(row["high"]),
                 low=float(row["low"]),
                 atr=float(row["atr"]) if not pd.isna(row["atr"]) else 0.0,
+                rsi=float(row["rsi"]) if not pd.isna(row["rsi"]) else 50.0,
                 regime=str(row["regime"]),
                 bars_held=self.portfolio.position_bars[symbol],
             )
@@ -452,7 +444,7 @@ class TradingEngine:
             signal, symbol, current_price, self.portfolio.balance, upnl,
         )
 
-        # 5. Strategy dispatch
+        # 5. Strategy dispatch (long-only — BUY opens, exits via check_exit only)
         if signal == Signal.BUY:
             await self._log(
                 level="INFO", category=CAT_STRATEGY, event=EVT_SIGNAL_GENERATED, symbol=symbol,
@@ -460,13 +452,6 @@ class TradingEngine:
                 data={"signal": "BUY", "rsi": _f(row.get("rsi")), "close_price": current_price, "reason": reason},
             )
             await self._handle_buy(symbol, current_price, signal_id)
-        elif signal == Signal.SELL:
-            await self._log(
-                level="INFO", category=CAT_STRATEGY, event=EVT_SIGNAL_GENERATED, symbol=symbol,
-                message=f"SELL signal  {symbol}  price={current_price:.4f}  reason={reason}",
-                data={"signal": "SELL", "rsi": _f(row.get("rsi")), "close_price": current_price, "reason": reason},
-            )
-            await self._handle_sell(symbol, current_price, signal_id)
         else:
             # HOLD: persist NO_ACTION for full signal coverage; no trade executed
             await self._make_decision(
@@ -562,46 +547,3 @@ class TradingEngine:
             symbol, result.quantity, fill_price, position_id, self.portfolio.balance,
         )
 
-    # ── Strategy-driven exit ──────────────────────────────────────────────
-
-    async def _handle_sell(self, symbol: str, price: float, signal_id: int) -> None:
-        pos = self.portfolio.positions.get(symbol)
-        proposed_qty = pos.quantity if pos else 0.0
-
-        sell_decision, sell_reject = evaluate_sell(pos is not None)
-        decision_id = await self._make_decision(
-            signal_id, sell_decision.value,
-            sell_reject.value if sell_reject else None,
-            proposed_qty,
-        )
-
-        if sell_decision == RiskDecision.REJECTED:
-            log.warning("SELL rejected  %s  reason=%s  decision_id=%d", symbol, sell_reject, decision_id)
-            await self._log(
-                level="WARNING", category=CAT_RISK, event=EVT_RISK_REJECTED, symbol=symbol,
-                message=f"SELL rejected  {symbol}  reason={sell_reject}",
-                data={"reason": sell_reject.value if sell_reject else None},
-                decision_id=decision_id,
-            )
-            return
-
-        entry_price = pos.entry_price  # type: ignore[union-attr]  # guaranteed non-None: APPROVED only if pos exists
-        log.info("SELL approved  %s  qty=%.6f  price=%.4f", symbol, pos.quantity, price)
-        await self._log(
-            level="INFO", category=CAT_RISK, event=EVT_DECISION_APPROVED, symbol=symbol,
-            message=f"SELL approved  {symbol}  qty={pos.quantity:.6f}  price={price:.4f}",
-            data={"side": "sell", "quantity": pos.quantity, "price": price},
-            decision_id=decision_id,
-        )
-
-        result, fill_price, closed_at = await self._execute_order(
-            "sell", symbol, pos.quantity, decision_id, price
-        )
-        trade_id = await self._save_fill(result, symbol, "sell", fill_price, decision_id)
-        pnl, position_id = await self._finalize_close(
-            symbol, trade_id, fill_price, closed_at, EVT_STRATEGY_EXIT, decision_id, entry_price
-        )
-        log.info(
-            "SELL executed  %s  qty=%.6f  fill=%.4f  pnl=%+.4f  position_id=%d  balance=%.2f",
-            symbol, result.quantity, fill_price, pnl, position_id, self.portfolio.balance,
-        )
