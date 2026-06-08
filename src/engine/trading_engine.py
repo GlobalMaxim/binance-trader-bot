@@ -14,7 +14,7 @@ from src.engine.portfolio import PortfolioState
 from src.execution.executor import OrderResult, execute_market_buy, execute_market_sell
 from src.features.indicators import candles_to_dataframe, compute_all_indicators
 from src.risk import risk
-from src.risk.risk import RejectReason, RiskConfig, RiskDecision, SLTPTrigger, check_sl_tp, position_size
+from src.risk.risk import RejectReason, RiskConfig, RiskDecision, SLTPTrigger, check_sl_tp, evaluate_sell, position_size
 from src.storage.candle_repo import upsert_candles
 from src.storage.decision_repo import DecisionRecord, save_decision
 from src.storage.log_repo import (
@@ -480,10 +480,6 @@ class TradingEngine:
     # ── Strategy-driven entry ─────────────────────────────────────────────
 
     async def _handle_buy(self, symbol: str, price: float, signal_id: int) -> None:
-        if self.portfolio.has_position(symbol):
-            log.debug("BUY signal for %s but position already open, skipping", symbol)
-            return
-
         proposed_qty = position_size(price, self.portfolio.balance, self.risk_config.capital_pct)
         decision_enum, approved_qty, reject_reason = risk.evaluate(
             symbol=symbol,
@@ -533,15 +529,27 @@ class TradingEngine:
     # ── Strategy-driven exit ──────────────────────────────────────────────
 
     async def _handle_sell(self, symbol: str, price: float, signal_id: int) -> None:
-        if not self.portfolio.has_position(symbol):
-            log.debug("SELL signal for %s but no open position, skipping", symbol)
+        pos = self.portfolio.positions.get(symbol)
+        proposed_qty = pos.quantity if pos else 0.0
+
+        sell_decision, sell_reject = evaluate_sell(pos is not None)
+        decision_id = await self._make_decision(
+            signal_id, sell_decision.value,
+            sell_reject.value if sell_reject else None,
+            proposed_qty,
+        )
+
+        if sell_decision == RiskDecision.REJECTED:
+            log.warning("SELL rejected  %s  reason=%s  decision_id=%d", symbol, sell_reject, decision_id)
+            await self._log(
+                level="WARNING", category=CAT_RISK, event=EVT_RISK_REJECTED, symbol=symbol,
+                message=f"SELL rejected  {symbol}  reason={sell_reject}",
+                data={"reason": sell_reject.value if sell_reject else None},
+                decision_id=decision_id,
+            )
             return
 
-        pos = self.portfolio.positions[symbol]
-        entry_price = pos.entry_price  # capture before close_position pops it
-        decision_id = await self._make_decision(
-            signal_id, RiskDecision.APPROVED.value, None, pos.quantity
-        )
+        entry_price = pos.entry_price  # type: ignore[union-attr]  # guaranteed non-None: APPROVED only if pos exists
         log.info("SELL approved  %s  qty=%.6f  price=%.4f", symbol, pos.quantity, price)
         await self._log(
             level="INFO", category=CAT_RISK, event=EVT_DECISION_APPROVED, symbol=symbol,
