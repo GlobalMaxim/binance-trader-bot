@@ -14,11 +14,7 @@ class RejectReason(StrEnum):
     MAX_POSITIONS = "MAX_POSITIONS"
     NO_OPEN_POSITION = "NO_OPEN_POSITION"
     HOLD_SIGNAL = "HOLD_SIGNAL"
-    SL_HIT = "SL_HIT"
-    TP_HIT = "TP_HIT"
-
-
-class SLTPTrigger(StrEnum):
+    # Legacy values kept for DB query compatibility — no longer written by new code
     SL_HIT = "SL_HIT"
     TP_HIT = "TP_HIT"
 
@@ -28,8 +24,6 @@ class RiskConfig:
     capital_pct: float = 0.02
     min_notional: float = 10.0
     max_positions_per_symbol: int = 1
-    sl_pct: float | None = 0.02   # stop-loss fraction of entry price; None = disabled
-    tp_pct: float | None = 0.04   # take-profit fraction of entry price; None = disabled
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,23 +88,3 @@ def evaluate_sell(
     if not has_open_position:
         return RiskDecision.REJECTED, RejectReason.NO_OPEN_POSITION
     return RiskDecision.APPROVED, None
-
-
-def check_sl_tp(
-    entry_price: float,
-    current_price: float,
-    config: RiskConfig,
-) -> SLTPTrigger | None:
-    """Evaluate stop-loss / take-profit thresholds for an open position.
-
-    Returns SL_HIT, TP_HIT, or None.
-    SL checked first so a gap-down that crosses both fires SL.
-    """
-    if entry_price <= 0:
-        return None
-    change_pct = (current_price - entry_price) / entry_price
-    if config.sl_pct is not None and change_pct <= -config.sl_pct:
-        return SLTPTrigger.SL_HIT
-    if config.tp_pct is not None and change_pct >= config.tp_pct:
-        return SLTPTrigger.TP_HIT
-    return None

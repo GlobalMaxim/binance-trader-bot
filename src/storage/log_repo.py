@@ -28,6 +28,9 @@ EVT_UNEXPECTED_EXCEPTION  = "unexpected_exception"
 EVT_DB_ERROR              = "db_error"
 EVT_SL_HIT                = "sl_hit"
 EVT_TP_HIT                = "tp_hit"
+EVT_TRAILING_STOP         = "trailing_stop"
+EVT_REGIME_FLIP           = "regime_flip"
+EVT_TIME_EXIT             = "time_exit"
 EVT_STRATEGY_EXIT         = "strategy_exit"
 
 

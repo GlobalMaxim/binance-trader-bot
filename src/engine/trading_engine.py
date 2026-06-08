@@ -14,7 +14,7 @@ from src.engine.portfolio import PortfolioState
 from src.execution.executor import OrderResult, execute_market_buy, execute_market_sell
 from src.features.indicators import candles_to_dataframe, compute_all_indicators
 from src.risk import risk
-from src.risk.risk import RejectReason, RiskConfig, RiskDecision, SLTPTrigger, check_sl_tp, evaluate_sell, position_size
+from src.risk.risk import RejectReason, RiskConfig, RiskDecision, evaluate_sell, position_size
 from src.storage.candle_repo import upsert_candles
 from src.storage.decision_repo import DecisionRecord, save_decision
 from src.storage.log_repo import (
@@ -30,10 +30,13 @@ from src.storage.log_repo import (
     EVT_POSITION_OPENED,
     EVT_RISK_REJECTED,
     EVT_SIGNAL_GENERATED,
+    EVT_REGIME_FLIP,
     EVT_SL_HIT,
     EVT_STRATEGY_EXIT,
     EVT_TICK_START,
+    EVT_TIME_EXIT,
     EVT_TP_HIT,
+    EVT_TRAILING_STOP,
     EVT_UNEXPECTED_EXCEPTION,
     safe_write_log,
 )
@@ -42,11 +45,26 @@ from src.storage.position_repo import load_open_positions
 from src.storage.position_repo import open_position as db_open_position
 from src.storage.signal_repo import SignalRecord, insert_signal
 from src.storage.trade_repo import save_trade
-from src.strategy.signals import Signal, generate_signals
+from src.strategy.signals import (
+    ExitCheckInput,
+    ExitReason,
+    Signal,
+    StrategyConfig,
+    check_exit,
+    generate_signals,
+)
 
 log = logging.getLogger(__name__)
 
 _MIN_CANDLES = 60  # enough for all indicators (EMA-50 + MACD-26 + warmup)
+
+_EXIT_EVT: dict[ExitReason, str] = {
+    ExitReason.STOP_LOSS:     EVT_SL_HIT,
+    ExitReason.TAKE_PROFIT:   EVT_TP_HIT,
+    ExitReason.TRAILING_STOP: EVT_TRAILING_STOP,
+    ExitReason.REGIME_FLIP:   EVT_REGIME_FLIP,
+    ExitReason.TIME_EXIT:     EVT_TIME_EXIT,
+}
 
 
 def _get_strategy_version() -> str:
@@ -109,6 +127,7 @@ class TradingEngine:
         self.pool = pool
         self.session_factory = session_factory
         self.risk_config = risk_config or RiskConfig()
+        self._strategy_cfg = StrategyConfig()
         self._strategy_version = _get_strategy_version()
 
     # ── DB log wrapper ────────────────────────────────────────────────────
@@ -403,14 +422,29 @@ class TradingEngine:
             ),
         )
 
-        # 4. SL/TP — RiskManager is the only component that closes without a SELL signal
+        # 4. ATR-based exit check — fires before strategy dispatch
         if self.portfolio.has_position(symbol):
-            trigger = check_sl_tp(
-                self.portfolio.positions[symbol].entry_price, current_price, self.risk_config
+            pos = self.portfolio.positions[symbol]
+            exit_row = ExitCheckInput(
+                ts=df.index[-1],
+                close=current_price,
+                high=float(row["high"]),
+                low=float(row["low"]),
+                atr=float(row["atr"]) if not pd.isna(row["atr"]) else 0.0,
+                regime=str(row["regime"]),
+                bars_held=self.portfolio.position_bars[symbol],
             )
-            if trigger is not None:
-                await self._handle_risk_exit(symbol, current_price, trigger)
-                return  # skip strategy for this tick
+            exit_reason = check_exit(
+                entry_price=pos.entry_price,
+                row=exit_row,
+                direction="long",
+                extreme_since_entry=self.portfolio.position_extreme[symbol],
+                cfg=self._strategy_cfg,
+            )
+            if exit_reason is not None:
+                await self._handle_risk_exit(symbol, current_price, exit_reason)
+                return
+            self.portfolio.tick_position(symbol, float(row["high"]), float(row["low"]))
 
         upnl = self.portfolio.unrealized_pnl(symbol, current_price)
         log.info(
@@ -442,25 +476,27 @@ class TradingEngine:
     # ── Forced exit (SL / TP) ─────────────────────────────────────────────
 
     async def _handle_risk_exit(
-        self, symbol: str, current_price: float, trigger: SLTPTrigger
+        self, symbol: str, current_price: float, exit_reason: ExitReason
     ) -> None:
         pos = self.portfolio.positions[symbol]
         entry_price = pos.entry_price  # capture before close_position pops it
         change_pct = (current_price - entry_price) / entry_price
-        evt = EVT_SL_HIT if trigger == SLTPTrigger.SL_HIT else EVT_TP_HIT
+        evt = _EXIT_EVT[exit_reason]
+        log_level = "WARNING" if exit_reason == ExitReason.STOP_LOSS else "INFO"
 
         decision_id = await self._make_decision(
-            None, RiskDecision.APPROVED.value, trigger.value, pos.quantity
+            None, RiskDecision.APPROVED.value, exit_reason.value, pos.quantity
         )
-        log.warning(
+        log.log(
+            logging.WARNING if exit_reason == ExitReason.STOP_LOSS else logging.INFO,
             "%s forced exit  %s  entry=%.4f  current=%.4f  chg=%.2f%%  decision_id=%d",
-            trigger.value, symbol, entry_price, current_price, change_pct * 100, decision_id,
+            exit_reason.value, symbol, entry_price, current_price, change_pct * 100, decision_id,
         )
         await self._log(
-            level="WARNING" if trigger == SLTPTrigger.SL_HIT else "INFO",
+            level=log_level,
             category=CAT_RISK, event=evt, symbol=symbol,
-            message=f"{trigger.value}  {symbol}  entry={entry_price:.4f}  current={current_price:.4f}  chg={change_pct:+.2%}",
-            data={"trigger": trigger.value, "entry_price": entry_price,
+            message=f"{exit_reason.value}  {symbol}  entry={entry_price:.4f}  current={current_price:.4f}  chg={change_pct:+.2%}",
+            data={"trigger": exit_reason.value, "entry_price": entry_price,
                   "current_price": current_price, "change_pct": round(change_pct, 6)},
             decision_id=decision_id,
         )
@@ -470,11 +506,11 @@ class TradingEngine:
         )
         trade_id = await self._save_fill(result, symbol, "sell", fill_price, decision_id)
         pnl, position_id = await self._finalize_close(
-            symbol, trade_id, fill_price, closed_at, trigger.value, decision_id, entry_price
+            symbol, trade_id, fill_price, closed_at, exit_reason.value, decision_id, entry_price
         )
         log.info(
             "%s executed  %s  qty=%.6f  fill=%.4f  pnl=%+.4f  position_id=%d  balance=%.2f",
-            trigger.value, symbol, result.quantity, fill_price, pnl, position_id, self.portfolio.balance,
+            exit_reason.value, symbol, result.quantity, fill_price, pnl, position_id, self.portfolio.balance,
         )
 
     # ── Strategy-driven entry ─────────────────────────────────────────────
